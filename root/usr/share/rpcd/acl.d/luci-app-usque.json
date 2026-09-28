@@ -1,0 +1,17 @@
+{
+    "luci-app-usque": {
+        "description": "Grant access to usque control",
+        "read": {
+            "ubus": {
+                "usque": ["status"]
+            }
+        },
+        "write": {
+            "ubus": {
+                "usque": ["register", "start", "stop"],
+                "service": ["restart", "reload", "start", "stop", "enable", "disable"]
+            },
+            "uci": ["usque"]
+        }
+    }
+}
