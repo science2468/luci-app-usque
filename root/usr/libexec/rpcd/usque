@@ -1,86 +1,52 @@
-#!/usr/bin/lua
+#!/usr/bin/ucode
+'use strict';
 
-local ubus = require "ubus"
-local uci = require "luci.model.uci".cursor()
-local sys = require "luci.sys"
+let fs = require('fs');
 
-local USQUE_BIN = "/usr/bin/usque"
-local CONFIG_DIR = "/etc/usque"
-local CONFIG_FILE = CONFIG_DIR .. "/config.json"
+const CONFIG_DIR  = '/etc/usque';
+const CONFIG_FILE = CONFIG_DIR + '/config.json';
 
-local function is_running()
-    return sys.call("pidof usque >/dev/null") == 0
-end
-
-local function do_register()
-    -- 确保目录存在
-    sys.call("mkdir -p " .. CONFIG_DIR)
-
-    -- 在 /etc/usque 目录下执行注册，使 config.json 生成到该目录
-    local cmd = string.format(
-        "cd %s && %s register -a 2>&1",
-        CONFIG_DIR, USQUE_BIN
-    )
-    local output = sys.exec(cmd)
-
-    if sys.call("test -f " .. CONFIG_FILE) == 0 then
-        return { success = true, message = output }
-    else
-        return { success = false, message = output }
-    end
-end
-
-local function do_start()
-    -- 如果尚未注册，拒绝启动
-    if sys.call("test -f " .. CONFIG_FILE) ~= 0 then
-        return { success = false, message = "尚未注册，请先执行注册" }
-    end
-
-    -- 通过 UCI 启用并启动服务
-    uci:set("usque", "global", "enabled", "1")
-    uci:commit("usque")
-    sys.call("/etc/init.d/usque start")
-
-    return { success = true, running = is_running() }
-end
-
-local function do_stop()
-    sys.call("/etc/init.d/usque stop")
-    return { success = true, running = is_running() }
-end
-
-local function do_status()
-    local registered = (sys.call("test -f " .. CONFIG_FILE) == 0)
-    return {
-        running = is_running(),
-        registered = registered,
-        enabled = (uci:get("usque", "global", "enabled") == "1"),
-        config_file = CONFIG_FILE
+function registered() {
+    try {
+        fs.readfile(CONFIG_FILE);
+        return true;
+    } catch (e) {
+        return false;
     }
-end
-
-local methods = {
-    register = function()
-        return do_register()
-    end,
-    start = function()
-        return do_start()
-    end,
-    stop = function()
-        return do_stop()
-    end,
-    status = function()
-        return do_status()
-    end
 }
 
-local conn = ubus.connect()
-if not conn then
-    os.exit(1)
-end
+const methods = {
+    status: function() {
+        return { registered: registered() };
+    },
 
-conn:add({
-    usque = methods
-}, true)
+    register: function() {
+        system('mkdir -p ' + CONFIG_DIR);
+        system('chmod 700 ' + CONFIG_DIR);
+        system('cd ' + CONFIG_DIR +
+               ' && /usr/bin/usque register -a >/dev/null 2>&1');
+        sleep(500);
+        return { success: true };
+    },
 
-conn:listen()
+    start: function() {
+        if (!registered())
+            return { success: false, message: 'Not registered yet' };
+        system('/etc/init.d/usque start >/dev/null 2>&1');
+        sleep(1000);
+        return { success: true };
+    },
+
+    stop: function() {
+        system('/etc/init.d/usque stop >/dev/null 2>&1');
+        sleep(500);
+        return { success: true };
+    }
+};
+
+if (length(ARGV) == 1 && ARGV[0] == 'list') {
+    print('{"status":{},"register":{},"start":{},"stop":{}}');
+} else if (length(ARGV) == 2 && ARGV[0] == 'call') {
+    let fn = methods[ARGV[1]];
+    print(fn ? sprintf('%J', fn()) : '{}');
+}
