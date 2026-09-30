@@ -1,18 +1,108 @@
 #!/usr/bin/ucode
-'use strict';
 
 let fs = require('fs');
 
 const CONFIG_DIR  = '/etc/usque';
 const CONFIG_FILE = CONFIG_DIR + '/config.json';
 
+const IFACE_NAME   = 'usque';      // UCI 接口名
+const ROUTE_TARGET = '1.1.1.1/32';
+
+// 执行命令并返回 stdout
+function cmd_output(cmd) {
+    let p = fs.popen(cmd, 'r');
+    if (!p) return '';
+    let out = p.read('all');
+    p.close();
+    return out || '';
+}
+
+// 仅检查 config.json 是否存在
 function registered() {
-    try {
-        fs.readfile(CONFIG_FILE);
-        return true;
-    } catch (e) {
-        return false;
+    return fs.readfile(CONFIG_FILE) !== null;
+}
+
+// 检查 /sys/class/net/<name> 是否存在
+function device_exists(name) {
+    if (!name) return false;
+    return trim(cmd_output('ls /sys/class/net/' + name + ' 2>/dev/null')) != '';
+}
+
+// 查找 usque 使用的 tun 设备：
+//   1) tun0（usque 默认设备）
+//   2) 其它 tun[0-9]+
+function find_tun_device() {
+    // 1) 默认 tun0
+    if (device_exists('tun0'))
+        return 'tun0';
+
+    // 2) 扫描其它 tunx
+    let out = trim(cmd_output('ls /sys/class/net 2>/dev/null'));
+    if (out) {
+        let names = split(out, '\n');
+        for (let i = 0; i < length(names); i++) {
+            let n = trim(names[i]);
+            if (match(n, /^tun[0-9]+$/))
+                return n;
+        }
     }
+    return null;
+}
+
+function uci_exists(path) {
+    return system('uci -q get ' + path + ' >/dev/null 2>&1') == 0;
+}
+
+// 查找父接口为 usque 的静态路由 section（返回 section 名或 null）
+function find_usque_route_section() {
+    let out = cmd_output('uci show network 2>/dev/null');
+    if (!out) return null;
+    let lines = split(out, '\n');
+    for (let i = 0; i < length(lines); i++) {
+        let line = trim(lines[i]);
+        if (!line) continue;
+        let m = match(line, /^network\.([^.=]+)=route$/);
+        if (m) {
+            let sec = m[1];
+            let iface = trim(cmd_output(
+                'uci -q get network.' + sec + '.interface 2>/dev/null'));
+            if (iface == IFACE_NAME)
+                return sec;
+        }
+    }
+    return null;
+}
+
+// 配置 usque 接口（绑定 tunx 设备）+ 指向它的静态路由
+function setup_network(dev) {
+    // 1) interface：UCI 名 usque，device 指向实际 tunx
+    if (!uci_exists('network.' + IFACE_NAME)) {
+        system('uci set network.' + IFACE_NAME + '=interface');
+        system('uci set network.' + IFACE_NAME + '.proto=none');
+        system('uci set network.' + IFACE_NAME + '.defaultroute=0');
+        system('uci set network.' + IFACE_NAME + '.multipath=off');
+    }
+    system('uci set network.' + IFACE_NAME + '.device=' + dev);
+
+    // 2) 静态路由：父接口为 usque 的 1.1.1.1/32
+    //    已存在则跳过，避免重复添加
+    if (!find_usque_route_section()) {
+        system('uci add network route');
+        system('uci set network.@route[-1].interface=' + IFACE_NAME);
+        system('uci set network.@route[-1].target=' + ROUTE_TARGET);
+    }
+
+    system('uci commit network');
+    return true;
+}
+
+// 删除原有 wan 区网络列表，将 wwan 与 usque 加入同一防火墙区域
+function setup_firewall() {
+    system('uci del firewall.@zone[-1].network >/dev/null 2>&1');
+    system('uci add_list firewall.@zone[-1].network=wwan');
+    system('uci add_list firewall.@zone[-1].network=usque');
+    system('uci commit firewall');
+    return true;
 }
 
 const methods = {
@@ -23,29 +113,64 @@ const methods = {
     register: function() {
         system('mkdir -p ' + CONFIG_DIR);
         system('chmod 700 ' + CONFIG_DIR);
-        system('cd ' + CONFIG_DIR +
+        let ret = system('cd ' + CONFIG_DIR +
                ' && /usr/bin/usque register -a >/dev/null 2>&1');
-        sleep(500);
+        if (ret != 0)
+            return { success: false, message: 'register command failed' };
+        if (!registered())
+            return { success: false, message: 'config file not created' };
         return { success: true };
     },
 
     start: function() {
         if (!registered())
             return { success: false, message: 'Not registered yet' };
+
         system('/etc/init.d/usque start >/dev/null 2>&1');
         sleep(1000);
-        return { success: true };
+
+        // 等待 tun 设备出现（最多 ~5s）：默认 tun0，或配置中的自定义名
+        let dev = null;
+        for (let i = 0; i < 2; i++) {
+            dev = find_tun_device();
+            if (dev) break;
+            sleep(500);
+        }
+
+        if (!dev)
+            return { success: true, network: false,
+                     message: 'TUN device not found' };
+
+        let net_ok = false, fw_ok = false;
+        try {
+            net_ok = setup_network(dev);
+            fw_ok = setup_firewall();
+        } catch (e) {
+            return { success: true, network: false,
+                     message: 'uci setup failed: ' + e };
+        }
+        return { success: true, network: net_ok && fw_ok, device: dev };
     },
 
     stop: function() {
         system('/etc/init.d/usque stop >/dev/null 2>&1');
         sleep(500);
         return { success: true };
+    },
+
+    // 手动重新配置网络（tun 已经起来时用）
+    setup: function() {
+        let dev = find_tun_device();
+        if (!dev)
+            return { success: false, message: 'TUN device not found' };
+        let net_ok = setup_network(dev);
+        let fw_ok = setup_firewall();
+        return { success: net_ok && fw_ok, device: dev };
     }
 };
 
 if (length(ARGV) == 1 && ARGV[0] == 'list') {
-    print('{"status":{},"register":{},"start":{},"stop":{}}');
+    print('{"status":{},"register":{},"start":{},"stop":{},"setup":{}}');
 } else if (length(ARGV) == 2 && ARGV[0] == 'call') {
     let fn = methods[ARGV[1]];
     print(fn ? sprintf('%J', fn()) : '{}');
